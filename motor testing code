@@ -1,0 +1,175 @@
+// micromouse_motortest_turn.ino
+// w = forward, l = left 90, r = right 90, s = stop
+// Turns are measured with the encoders. Serial Monitor at 115200 baud.
+
+#define AIN1 26
+#define AIN2 25
+#define PWMA 19
+#define BIN1 27
+#define BIN2 14
+#define PWMB 18
+#define STBY 13
+
+#define ENC_L_C1 34
+#define ENC_R_C1 2
+
+int speedFwd  = 150;
+int speedTurn = 110;       // keep turn speed lowish for accuracy
+long turnCounts = 300;     // average encoder counts per wheel for 90 deg. TUNE THIS
+const unsigned long TURN_TIMEOUT = 3000;  // ms safety
+
+const int LEFT_DIR  = -1;
+const int RIGHT_DIR = -1;
+
+volatile long encL = 0, encR = 0;
+
+// Counts every edge of C1 (direction ignored, we use absolute counts)
+void IRAM_ATTR isrL() { encL++; }
+void IRAM_ATTR isrR() { encR++; }
+
+void setLeft(int speed) {
+  speed *= LEFT_DIR;
+  digitalWrite(AIN1, speed > 0);
+  digitalWrite(AIN2, speed < 0);
+  analogWrite(PWMA, constrain(abs(speed), 0, 255));
+}
+
+void setRight(int speed) {
+  speed *= RIGHT_DIR;
+  digitalWrite(BIN1, speed > 0);
+  digitalWrite(BIN2, speed < 0);
+  analogWrite(PWMB, constrain(abs(speed), 0, 255));
+}
+
+void stopMotors() {
+  setLeft(0);
+  setRight(0);
+}
+
+// Short brake: stops faster than coasting, so less overshoot
+void brakeMotors() {
+  digitalWrite(AIN1, HIGH); digitalWrite(AIN2, HIGH); analogWrite(PWMA, 255);
+  digitalWrite(BIN1, HIGH); digitalWrite(BIN2, HIGH); analogWrite(PWMB, 255);
+  delay(80);
+  stopMotors();
+}
+
+void resetEnc() {
+  noInterrupts();
+  encL = 0;
+  encR = 0;
+  interrupts();
+}
+
+long getL() { noInterrupts(); long v = encL; interrupts(); return v; }
+long getR() { noInterrupts(); long v = encR; interrupts(); return v; }
+
+// dir: +1 = right, -1 = left
+// dir: +1 = right, -1 = left
+void turn90(int dir) {
+  resetEnc();
+
+  const int  minSpeed  = 70;    // slowest speed that still moves the wheels
+  const long slowZone  = 120;   // start slowing this many counts before target
+
+  unsigned long start = millis();
+  bool leftDone = false, rightDone = false;
+
+  while (!(leftDone && rightDone) && millis() - start < TURN_TIMEOUT) {
+    long l = getL(), r = getR();
+
+    if (!leftDone) {
+      long remain = turnCounts - l;
+      if (remain <= 0) { setLeft(0); leftDone = true; }
+      else {
+        int sp = (remain < slowZone)
+                 ? map(remain, 0, slowZone, minSpeed, speedTurn)
+                 : speedTurn;
+        setLeft(dir * sp);
+      }
+    }
+    if (!rightDone) {
+      long remain = turnCounts - r;
+      if (remain <= 0) { setRight(0); rightDone = true; }
+      else {
+        int sp = (remain < slowZone)
+                 ? map(remain, 0, slowZone, minSpeed, speedTurn)
+                 : speedTurn;
+        setRight(-dir * sp);
+      }
+    }
+  }
+  brakeMotors();
+  delay(150);   // let the wheels settle
+  Serial.print("Turn done  L="); Serial.print(getL());
+  Serial.print("  R="); Serial.println(getR());
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT); pinMode(PWMA, OUTPUT);
+  pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT); pinMode(PWMB, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH);
+  stopMotors();
+
+  pinMode(ENC_L_C1, INPUT);
+  pinMode(ENC_R_C1, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_L_C1), isrL, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_C1), isrR, CHANGE);
+
+  Serial.println("Ready: w fwd | l left | r right | s stop");
+  Serial.println("      ] / [ = turnCounts +5 / -5   + / - = turn speed");
+}
+
+void loop() {
+  if (!Serial.available()) return;
+  char c = Serial.read();
+
+  switch (c) {
+    case 'w': case 'W':
+      Serial.println("FORWARD");
+      setLeft(speedFwd);
+      setRight(speedFwd);
+      break;
+
+    case 'l': case 'L':
+      Serial.println("LEFT");
+      turn90(-1);
+      break;
+
+    case 'r': case 'R':
+      Serial.println("RIGHT");
+      turn90(+1);
+      break;
+
+    case 's': case 'S': case ' ':
+      Serial.println("STOP");
+      brakeMotors();
+      break;
+
+    case ']':
+      turnCounts += 5;
+      Serial.print("turnCounts = "); Serial.println(turnCounts);
+      break;
+
+    case '[':
+      turnCounts = max(5L, turnCounts - 5);
+      Serial.print("turnCounts = "); Serial.println(turnCounts);
+      break;
+
+    case '+':
+      speedTurn = min(255, speedTurn + 10);
+      Serial.print("speedTurn = "); Serial.println(speedTurn);
+      break;
+
+    case '-':
+      speedTurn = max(60, speedTurn - 10);
+      Serial.print("speedTurn = "); Serial.println(speedTurn);
+      break;
+
+    default:
+      break;
+  }
+}
