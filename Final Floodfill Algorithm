@@ -1,0 +1,512 @@
+/*
+ * ================================================================
+ *  MICROMOUSE 3x3 MAZE SOLVER - AUTONOMOUS (competition) EDITION
+ *  No WiFi, no web page. Two pushbuttons and one status LED.
+ *  (turning uses ENCODER TICKS ONLY: raw PWM, no gain, no speed loop)
+ *  Hardware : ESP32 (Arduino core 3.x) + TB6612FNG + 3x VL53L1X
+ *             (Pololu VL53L1X library) + N20 quadrature encoders
+ *  Maze     : 3x3 cells. Start (0,0) facing NORTH. Goal: centre (1,1).
+ *             x grows to the east, y grows to the north.
+ *
+ *  BUTTONS (each wired between the pin and GND, internal pull-up is used)
+ *   RUN  button (GPIO 23)
+ *     short press : robot idle at start  -> EXPLORE & MAP (starts after a short countdown)
+ *                   map finished (LED on) -> FINAL RUN     (starts after a short countdown)
+ *     press while the robot is moving     -> STOP
+ *   BACK button (GPIO 16)
+ *     short press : robot carried back to the start, KEEP the map (repeat the final run).
+ *                   If there is no finished map yet, it does a reset instead.
+ *     long press (1 s) : RESET, wipe the map (start a new exploration)
+ *
+ *  STATUS LED (GPIO 17, optional, with a resistor to GND)
+ *     slow blink = idle / ready      fast blink = running
+ *     solid on   = map finished or final run done     very fast blink = error / stopped
+ *
+ *  USUAL COMPETITION FLOW
+ *   1. Place the robot in the start cell facing north. LED slow blink.
+ *   2. Press RUN. Take your hand away during the countdown. It explores and returns to the start.
+ *   3. LED solid on = map finished. Press RUN again for the fast run to the centre.
+ *   4. To run again: carry the robot to the start, press BACK, then RUN.
+ *   5. Anything wrong (LED very fast): put the robot at the start, long-press BACK, press RUN.
+ *
+ *  The USB serial monitor (115200) still works for calibration and debugging, with the same
+ *  single-key commands as before (h = help). You do not need it during the competition.
+ *
+ *  TUNED VALUES
+ *   cell = 3677 ticks, 90-degree turn = 1269 ticks, U-turn = 2528 ticks,
+ *   left gain 0.941, right gain 0.980 (gains are used for straight driving only)
+ *
+ *  APPLY_TUNED_ON_BOOT = 1 writes the tuned values into flash at every boot.
+ *  FOR THE COMPETITION set it to 0 (so key adjustments you made are kept) and upload again.
+ *
+ *  SETUP ORDER (serial monitor): k (cell length) -> c (front distance) -> v (motor balance)
+ *  NOTE: key v overwrites the gains with measured ones. Skip v to keep 0.941 / 0.980.
+ * ================================================================
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <VL53L1X.h>
+#include <Preferences.h>
+#include <esp_system.h>
+
+// All messages go to the USB serial port only.
+#define console Serial
+
+// ============================ PINS ============================
+#define PIN_AIN1 26
+#define PIN_AIN2 25
+#define PIN_PWMA 19
+#define PIN_BIN1 27
+#define PIN_BIN2 14
+#define PIN_PWMB 18
+#define PIN_STBY 13
+
+#define PIN_ENC_L_A 34
+#define PIN_ENC_L_B 35
+#define PIN_ENC_R_A 2     // GPIO 2 and 15 are strapping pins: unplug them if an upload fails
+#define PIN_ENC_R_B 15
+
+#define PIN_XSHUT_FRONT 33
+#define PIN_XSHUT_LEFT  32
+#define PIN_XSHUT_RIGHT 4
+#define PIN_I2C_SDA 21
+#define PIN_I2C_SCL 22
+
+#define PIN_BTN_RUN  23   // pushbutton to GND
+#define PIN_BTN_BACK 16   // pushbutton to GND (on a WROVER module GPIO 16/17 are used by PSRAM: pick other pins)
+#define PIN_LED      17   // status LED through a resistor to GND. Set to -1 if you have no LED
+
+// ============================ MAZE ============================
+#define GRID_SIZE 3
+#define START_X 0
+#define START_Y 0
+#define START_DIR DIR_N
+#define GOAL_X  1
+#define GOAL_Y  1
+
+#define DIR_N 0
+#define DIR_E 1
+#define DIR_S 2
+#define DIR_W 3
+
+#define WALL_N 1
+#define WALL_E 2
+#define WALL_S 4
+#define WALL_W 8
+
+// 1 = after reaching the centre, visit every other reachable cell before going home.
+//     The map is then complete and the final run is truly the shortest path.
+// 0 = centre, then straight home. The final run only uses cells that were visited.
+#define EXPLORE_ALL 1
+
+// ============================ FIXED VALUES ============================
+// Wheel / encoder polarity, found by testing. "forward" must give positive counts.
+const int LEFT_DIR       = -1;
+const int RIGHT_DIR      = -1;
+const int LEFT_ENC_SIGN  = -1;
+const int RIGHT_ENC_SIGN = +1;
+
+// ---- Tuned calibration ----
+const long  DEFAULT_CELL_TICKS  = 3677;
+const long  DEFAULT_TURN_TICKS  = 1269;     // 90-degree turn, encoder ticks
+const long  DEFAULT_UTURN_TICKS = 2528;     // 180-degree turn, encoder ticks
+const float DEFAULT_GAIN_L      = 0.941f;   // straight driving only
+const float DEFAULT_GAIN_R      = 0.980f;   // straight driving only
+
+// 1 = write the tuned values above into flash on every boot (use once, then set back to 0)
+#define APPLY_TUNED_ON_BOOT 1
+
+// Speeds, in "speed units" 0-255 (about the PWM a typical motor needs for that speed).
+const int   SPEED_FWD      = 150;   // exploration speed. Raise by 10-15 only once it stops bumping
+const int   SPEED_FAST     = 165;   // final run speed (raise gradually, keep it above SPEED_FWD in the end)
+const int   SPEED_MIN      = 80;    // start / end speed of each move
+const float ACCEL_FRAC     = 0.25f; // fraction of a cell used to speed up
+const float DECEL_FRAC     = 0.25f; // fraction of a cell used to slow down
+
+// ---- Turning: ticks only, raw PWM, no gain, no speed loop ----
+const int   TURN_PWM       = 90;    // raw PWM on both wheels during the turn
+const int   TURN_PWM_MIN   = 80;    // raw PWM in the slow zone (raise if a wheel stalls)
+const float TURN_SLOW_FRAC = 0.25f; // last fraction of the turn done at the lower PWM
+
+// ---- Turn stall protection ----
+const uint32_t TURN_STALL_MS   = 80;     // no tick progress for this long = stalled
+const int      TURN_KICK_STEP  = 8;      // extra PWM added each time a stall is seen
+const int      TURN_KICK_MAX   = 70;     // largest extra PWM
+const float    TURN_OK_FRAC    = 0.97f;  // after a stall, this much of the turn counts as done
+const float    TURN_TIMEOUT_OK = 0.90f;  // on timeout, accept a turn that got this far
+
+// ---- Separate control for the LEFT and RIGHT motor (straight driving only) ----
+// Each wheel gets its own speed loop. Tune the two sides independently if the motors differ.
+// kp: PWM per unit of speed error.  ki: PWM per unit of error per second.
+const float KP_SPD_L = 0.40f, KI_SPD_L = 2.0f;
+const float KP_SPD_R = 0.40f, KI_SPD_R = 2.0f;
+// Smallest PWM that makes that wheel move at all (0 = off). Raise it for a weak motor that stalls
+// at low speed.
+const int   LEFT_MIN_PWM  = 0;
+const int   RIGHT_MIN_PWM = 0;
+const float PI_LIMIT      = 60.0f;  // largest correction the speed loop may add (PWM)
+const int   BALANCE_PWM   = 150;    // test speed used by the v (balance) command
+
+// Wall detection (mm). Key d shows live readings so you can adjust these.
+// Set from the real readings: walls read about 40-66 mm on the sides and about 61 mm in front,
+// open space reads 245 mm or more.
+const int SIDE_WALL_MM   = 100;
+const int FRONT_WALL_MM  = 120;
+const int SIDE_TARGET_MM = 55;    // starting guess for the distance to a side wall when centred (it is learned while driving)
+const int FRONT_STOP_MM  = 20;    // stop this far from the front wall if key c was not used
+const int APPROACH_MM    = 120;   // within this distance of the stop point, slow down whatever the encoders say
+const int STEER_SLEW     = 10;    // largest steering change per control tick
+
+// Wall following (positive steer = turn right = left wheel faster)
+const float KP_WALL  = 0.5f;
+const float KD_WALL  = 0.8f;
+const float KP_SIDE  = 0.6f;
+const float KD_SIDE  = 1.0f;
+const float KP_ENC   = 0.8f;
+const int   STEER_MAX = 40;
+
+// Self-correcting wall following
+const float KI_WALL      = 2.0f;    // integral gain (steer per mm of error per second)
+const float WALL_I_MAX   = 8.0f;    // largest integral contribution
+const float TARGET_LEARN = 0.03f;   // how fast the centred distance is learned
+const int   TARGET_MIN_MM = 35, TARGET_MAX_MM = 90;
+
+// Timing / safety
+const uint32_t CTL_MS            = 20;
+const uint32_t MOVE_TIMEOUT_MS   = 8000;   // per cell
+const uint32_t TURN_TIMEOUT_MS   = 6000;
+const uint32_t ENC_CHECK_MS      = 400;
+const int32_t  MIN_TICKS         = 3;
+const uint32_t STALE_MS          = 500;
+const uint32_t SAMPLE_TIMEOUT_MS = 600;
+
+// Buttons
+const uint32_t BTN_DEBOUNCE_MS   = 30;
+const uint32_t BTN_LONG_MS       = 1000;   // long press on BACK = full reset
+const uint32_t BTN_STOP_MS       = 40;     // a button held this long while moving = STOP
+const uint32_t START_DELAY_MS    = 2000;   // countdown after RUN so you can take your hand away
+
+// ============================ GLOBALS ============================
+Preferences prefs;
+
+struct Button {
+  uint8_t  pin;
+  bool     down;
+  bool     fired;     // long press already reported
+  uint32_t since;
+};
+Button btnRun  = {PIN_BTN_RUN,  false, false, 0};
+Button btnBack = {PIN_BTN_BACK, false, false, 0};
+long  cellTicks  = DEFAULT_CELL_TICKS;
+long  turnTicks  = DEFAULT_TURN_TICKS;    // 90-degree turn, encoder ticks
+long  uTurnTicks = DEFAULT_UTURN_TICKS;   // 180-degree turn, encoder ticks
+int   frontCenterMm = 0;      // front reading at a cell centre with a wall ahead. 0 = not calibrated (press c)
+float sideTargetMm = SIDE_TARGET_MM;   // learned centred distance to a side wall
+
+int     robotX = START_X, robotY = START_Y;
+uint8_t robotDir = START_DIR;
+uint8_t wallsMap[GRID_SIZE][GRID_SIZE];    // [y][x], bit set = wall on that side
+bool    visited[GRID_SIZE][GRID_SIZE];
+int     distMap[GRID_SIZE][GRID_SIZE];     // flood fill values (towards the current target)
+
+enum State { ST_IDLE, ST_SENSE, ST_PLAN, ST_TURN, ST_MOVE, ST_MAPPED, ST_FINAL, ST_DONE, ST_ERROR };
+const char *const STATE_NAME[] = {"IDLE", "SENSING", "PLANNING", "TURNING", "MOVING",
+                                  "MAPPED", "FINAL RUN", "DONE", "ERROR"};
+State state = ST_IDLE;
+
+enum Phase { PH_GOAL, PH_EXPLORE, PH_HOME };
+const char *const PHASE_NAME[] = {"to centre", "exploring", "going home"};
+Phase phase = PH_GOAL;
+int   tgtX = GOAL_X, tgtY = GOAL_Y;
+int8_t nextDir = -1;
+
+bool mapComplete = false;    // exploration finished: a final run is possible
+bool poseDirty   = false;    // true after any motion; reposition the robot before the next run
+bool abortFlag   = false;
+int  lastLeftMm = 9999, lastRightMm = 9999;
+
+// Sensors
+enum { S_FRONT = 0, S_LEFT = 1, S_RIGHT = 2 };
+const char *const SNAME[3] = {"Front", "Left", "Right"};
+VL53L1X sensor[3];
+struct Reading {
+  int      mm;       // 9999 when nothing valid was seen (treated as open space)
+  bool     valid;
+  uint32_t ms;       // time of the last reading
+  uint32_t seq;      // increments with every new reading
+};
+Reading rd[3] = {{9999, false, 0, 0}, {9999, false, 0, 0}, {9999, false, 0, 0}};
+bool sensorOk[3] = {false, false, false};
+
+// ============================ COMMAND QUEUE (USB serial) ============================
+// Serial commands are queued; the main loop executes them. While the robot is
+// moving, only 's' (stop) is looked at.
+#define CMDQ 16
+char    cmdQ[CMDQ];
+uint8_t cmdHead = 0, cmdTail = 0;
+
+void enqueueCmd(char c) {
+  uint8_t n = (cmdHead + 1) % CMDQ;
+  if (n != cmdTail) {
+    cmdQ[cmdHead] = c;
+    cmdHead = n;
+  }
+}
+int dequeueCmd() {
+  if (cmdHead == cmdTail) return -1;
+  char c = cmdQ[cmdTail];
+  cmdTail = (cmdTail + 1) % CMDQ;
+  return (unsigned char)c;
+}
+void flushCmdQueue() { cmdTail = cmdHead; }
+
+void pollSerial() {
+  while (Serial.available()) {
+    int c = Serial.read();
+    if (c > ' ' && c < 127) enqueueCmd((char)c);
+  }
+}
+
+// ============================ STATUS LED ============================
+bool running() {
+  return state == ST_SENSE || state == ST_PLAN || state == ST_TURN || state == ST_MOVE || state == ST_FINAL;
+}
+
+void ledUpdate() {
+  if (PIN_LED < 0) return;
+  uint32_t t = millis();
+  bool on;
+  if (state == ST_ERROR)                          on = (t % 200) < 100;    // very fast blink
+  else if (running())                             on = (t % 400) < 200;    // fast blink
+  else if (state == ST_MAPPED || state == ST_DONE) on = true;              // solid
+  else                                            on = (t % 1000) < 100;   // idle: short slow blink
+  digitalWrite(PIN_LED, on ? HIGH : LOW);
+}
+
+// ============================ ENCODERS ============================
+// Full quadrature decoding (4 counts per encoder cycle) on both channels.
+volatile int32_t encL = 0, encR = 0;
+volatile uint8_t prevL = 0, prevR = 0;
+portMUX_TYPE encMux = portMUX_INITIALIZER_UNLOCKED;
+
+static const int8_t QDEC[16] = {
+   0, +1, -1,  0,
+  -1,  0,  0, +1,
+  +1,  0,  0, -1,
+   0, -1, +1,  0
+};
+
+void IRAM_ATTR isrL() {
+  uint8_t s = (digitalRead(PIN_ENC_L_A) << 1) | digitalRead(PIN_ENC_L_B);
+  portENTER_CRITICAL_ISR(&encMux);
+  encL = encL + QDEC[(prevL << 2) | s];
+  prevL = s;
+  portEXIT_CRITICAL_ISR(&encMux);
+}
+
+void IRAM_ATTR isrR() {
+  uint8_t s = (digitalRead(PIN_ENC_R_A) << 1) | digitalRead(PIN_ENC_R_B);
+  portENTER_CRITICAL_ISR(&encMux);
+  encR = encR + QDEC[(prevR << 2) | s];
+  prevR = s;
+  portEXIT_CRITICAL_ISR(&encMux);
+}
+
+// Counts with the sign fixed so that forward wheel motion is positive.
+int32_t readEncL() {
+  portENTER_CRITICAL(&encMux);
+  int32_t v = encL;
+  portEXIT_CRITICAL(&encMux);
+  return v * LEFT_ENC_SIGN;
+}
+
+int32_t readEncR() {
+  portENTER_CRITICAL(&encMux);
+  int32_t v = encR;
+  portEXIT_CRITICAL(&encMux);
+  return v * RIGHT_ENC_SIGN;
+}
+
+// ============================ MOTORS ============================
+static void driveMotor(uint8_t in1, uint8_t in2, uint8_t pwmPin, int speed, int dir) {
+  speed = constrain(speed * dir, -255, 255);
+  if (speed > 0)      { digitalWrite(in1, HIGH); digitalWrite(in2, LOW);  }
+  else if (speed < 0) { digitalWrite(in1, LOW);  digitalWrite(in2, HIGH); }
+  else                { digitalWrite(in1, LOW);  digitalWrite(in2, LOW);  }
+  ledcWrite(pwmPin, abs(speed));
+}
+
+// Raw PWM per wheel. Positive = that wheel moves the robot forward.
+void setMotors(int l, int r) {
+  driveMotor(PIN_AIN1, PIN_AIN2, PIN_PWMA, l, LEFT_DIR);
+  driveMotor(PIN_BIN1, PIN_BIN2, PIN_PWMB, r, RIGHT_DIR);
+}
+
+void stopMotors() { setMotors(0, 0); }
+
+void brakeMotors() {
+  digitalWrite(PIN_AIN1, HIGH); digitalWrite(PIN_AIN2, HIGH); ledcWrite(PIN_PWMA, 255);
+  digitalWrite(PIN_BIN1, HIGH); digitalWrite(PIN_BIN2, HIGH); ledcWrite(PIN_PWMB, 255);
+  delay(60);
+  stopMotors();
+  delay(80);
+}
+
+bool fault(const char *msg) {
+  stopMotors();
+  console.printf("FAULT: %s\r\n", msg);
+  return false;
+}
+
+// ---- Separate control for each wheel (index 0 = left, 1 = right) ----
+// Used for STRAIGHT DRIVING ONLY. Turning does not use any of this.
+// Feed-forward: PWM = target * wGain[w]   (corrects the motors' different strength)
+// Speed loop  : PI on the wheel's measured speed (corrects what is left, e.g. load or battery)
+// The speed loop needs tpsPerUnit (encoder ticks per second per speed unit), set by key v.
+#define W_L 0
+#define W_R 1
+float   wGain[2]  = {DEFAULT_GAIN_L, DEFAULT_GAIN_R};
+const float W_KP[2]     = {KP_SPD_L, KP_SPD_R};
+const float W_KI[2]     = {KI_SPD_L, KI_SPD_R};
+const int   W_MINPWM[2] = {LEFT_MIN_PWM, RIGHT_MIN_PWM};
+float    wInteg[2]   = {0, 0};
+float    wMeas[2]    = {0, 0};      // measured speed in speed units (smoothed)
+int32_t  wLastEnc[2] = {0, 0};
+uint32_t wLastMs[2]  = {0, 0};
+float    tpsPerUnit  = 0;           // 0 = not calibrated: only the gains are used
+
+void wheelReset(uint8_t w, int32_t enc) {
+  wInteg[w]   = 0;
+  wMeas[w]    = 0;
+  wLastEnc[w] = enc;
+  wLastMs[w]  = millis();
+}
+
+// target: wanted speed in speed units (signed, forward positive).
+// enc: this wheel's current count (forward positive). Returns the PWM to apply.
+int wheelUpdate(uint8_t w, float target, int32_t enc) {
+  uint32_t now = millis();
+  float dt = (now - wLastMs[w]) / 1000.0f;
+  if (dt < 0.002f) dt = 0.002f;
+  float tps = (float)(enc - wLastEnc[w]) / dt;
+  wLastEnc[w] = enc;
+  wLastMs[w]  = now;
+
+  float out = target * wGain[w];
+  if (tpsPerUnit > 0.0f) {
+    float meas = tps / tpsPerUnit;
+    wMeas[w] += 0.5f * (meas - wMeas[w]);
+    float err = target - wMeas[w];
+    wInteg[w] += W_KI[w] * err * dt;
+    wInteg[w] = constrain(wInteg[w], -PI_LIMIT, PI_LIMIT);
+    out += W_KP[w] * err + wInteg[w];
+  }
+
+  // The correction may slow a wheel down but never reverse it.
+  if (target > 0)      out = fmaxf(out, 0.0f);
+  else if (target < 0) out = fminf(out, 0.0f);
+  else                 out = 0.0f;
+
+  if (target != 0 && fabsf(out) < (float)W_MINPWM[w]) out = (target > 0) ? (float)W_MINPWM[w] : -(float)W_MINPWM[w];
+  return constrain((int)lroundf(out), -255, 255);
+}
+
+// ============================ SENSORS ============================
+bool initSensor(uint8_t i, uint8_t xshutPin, uint8_t addr) {
+  digitalWrite(xshutPin, HIGH);
+  delay(10);
+  sensor[i].setTimeout(500);
+  if (!sensor[i].init()) {
+    console.printf("%s sensor FAILED\r\n", SNAME[i]);
+    digitalWrite(xshutPin, LOW);      // keep it off the bus so the next sensor can start at 0x29
+    return false;
+  }
+  sensor[i].setAddress(addr);
+  sensor[i].setDistanceMode(VL53L1X::Short);
+  sensor[i].setMeasurementTimingBudget(20000);
+  sensor[i].startContinuous(25);
+  rd[i].ms = millis();
+  console.printf("%s sensor OK @ 0x%02X\r\n", SNAME[i], addr);
+  return true;
+}
+
+void setupSensors() {
+  pinMode(PIN_XSHUT_FRONT, OUTPUT);
+  pinMode(PIN_XSHUT_LEFT,  OUTPUT);
+  pinMode(PIN_XSHUT_RIGHT, OUTPUT);
+  digitalWrite(PIN_XSHUT_FRONT, LOW);
+  digitalWrite(PIN_XSHUT_LEFT,  LOW);
+  digitalWrite(PIN_XSHUT_RIGHT, LOW);
+  delay(50);
+
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  Wire.setClock(100000);            // slow clock while the addresses are assigned
+  sensorOk[S_FRONT] = initSensor(S_FRONT, PIN_XSHUT_FRONT, 0x30);
+  sensorOk[S_LEFT]  = initSensor(S_LEFT,  PIN_XSHUT_LEFT,  0x31);
+  sensorOk[S_RIGHT] = initSensor(S_RIGHT, PIN_XSHUT_RIGHT, 0x32);
+  Wire.setClock(400000);
+}
+
+bool allSensorsOk() { return sensorOk[0] && sensorOk[1] && sensorOk[2]; }
+
+// Non-blocking: picks up whatever new readings are ready.
+void updateSensors() {
+  for (uint8_t i = 0; i < 3; i++) {
+    if (!sensorOk[i]) continue;
+    if (!sensor[i].dataReady()) continue;
+    sensor[i].read(false);
+    VL53L1X::RangeStatus st = sensor[i].ranging_data.range_status;
+    bool ok = (st == VL53L1X::RangeValid) ||
+              (st == VL53L1X::RangeValidMinRangeClipped) ||
+              (st == VL53L1X::RangeValidNoWrapCheckFail);
+    rd[i].valid = ok;
+    rd[i].mm    = ok ? (int)sensor[i].ranging_data.range_mm : 9999;
+    rd[i].ms    = millis();
+    rd[i].seq++;
+  }
+}
+
+// Everything that has to keep running while the robot is busy: sensors, serial, LED.
+void backgroundTick() {
+  updateSensors();
+  pollSerial();
+  ledUpdate();
+}
+
+// Looks for a STOP request at any time during a motion: 's' on serial, or either button
+// held for BTN_STOP_MS. Other keys pressed meanwhile are dropped.
+bool abortRequested() {
+  pollSerial();
+  int c;
+  while ((c = dequeueCmd()) >= 0) {
+    if (c == 's' || c == 'S') abortFlag = true;
+  }
+
+  static uint32_t downSince = 0;
+  bool down = (digitalRead(PIN_BTN_RUN) == LOW) || (digitalRead(PIN_BTN_BACK) == LOW);
+  if (down) {
+    if (downSince == 0) downSince = millis();
+    else if (millis() - downSince >= BTN_STOP_MS) abortFlag = true;
+  } else {
+    downSince = 0;
+  }
+  return abortFlag;
+}
+
+bool fresh(uint8_t i) {
+  return sensorOk[i] && (millis() - rd[i].ms <= STALE_MS);
+}
+
+// Median of 5 fresh readings per sensor (used when standing still in a cell centre).
+// hits[i] counts how many of the 5 readings were below thr[i].
+bool sampleAllEx(int out[3], const int thr[3], uint8_t hits[3]) {
+  int     vals[3][5];
+  uint8_t n[3] = {0, 0, 0};
+  uint32_t last[3];
+  for (uint8_t i = 0; i < 3; i++) { last[i] = rd[i].seq; hits[i] = 0; }
+
+  uint32_t t0 = millis();
+  while (millis() - t0 < SAMPLE_TIMEOUT_MS) {
+    backgroundTick();
+    bool done = true;
