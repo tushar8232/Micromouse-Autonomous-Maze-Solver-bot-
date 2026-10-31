@@ -2,7 +2,7 @@
 
 <img width="1086" height="1448" alt="Image" src="https://github.com/user-attachments/assets/68090adb-87a6-462c-852c-2c0c43ba0eb9" />
 
-<img width="1087" height="1447" alt="Image" src="https://github.com/user-attachments/assets/d7f638a1-e994-4440-90a1-5410de52664a" />
+<img width="610" height="1247" alt="Image" src="https://github.com/user-attachments/assets/3c3665a1-3a20-4940-9d94-934f6afc790b" />
 
 ### An Autonomous Maze-Solving Robot Powered by ESP32
 
