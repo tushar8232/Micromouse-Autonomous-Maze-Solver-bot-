@@ -1,5 +1,7 @@
 # 🐭 Micromouse Maze Solver
 
+<img width="1086" height="1448" alt="Image" src="https://github.com/user-attachments/assets/68090adb-87a6-462c-852c-2c0c43ba0eb9" />
+
 ### An Autonomous Maze-Solving Robot Powered by ESP32
 
 An autonomous Micromouse robot designed to explore, map, and solve mazes using the **FloodFill algorithm**, three VL53L1X Time-of-Flight (ToF) distance sensors, and encoder-based motor control.
