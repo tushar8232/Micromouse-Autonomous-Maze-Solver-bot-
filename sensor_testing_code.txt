@@ -1,0 +1,58 @@
+// micromouse_sensortest.ino
+// Needs the "VL53L1X" library by Pololu (Library Manager). Serial Monitor at 115200.
+#include <Wire.h>
+#include <VL53L1X.h>
+
+#define XSHUT_FRONT 33
+#define XSHUT_LEFT  32
+#define XSHUT_RIGHT 4
+
+VL53L1X sFront, sLeft, sRight;
+
+bool startSensor(VL53L1X &s, int xshutPin, uint8_t addr, const char* name) {
+  pinMode(xshutPin, INPUT);          // release XSHUT, sensor wakes up
+  delay(10);
+  s.setTimeout(500);
+  if (!s.init()) {
+    Serial.print("FAILED to init "); Serial.println(name);
+    return false;
+  }
+  s.setAddress(addr);
+  s.setDistanceMode(VL53L1X::Short);
+  s.setMeasurementTimingBudget(33000);
+  s.startContinuous(33);
+  Serial.print(name); Serial.println(" OK");
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+
+  // Hold all sensors in reset
+  pinMode(XSHUT_FRONT, OUTPUT); digitalWrite(XSHUT_FRONT, LOW);
+  pinMode(XSHUT_LEFT,  OUTPUT); digitalWrite(XSHUT_LEFT,  LOW);
+  pinMode(XSHUT_RIGHT, OUTPUT); digitalWrite(XSHUT_RIGHT, LOW);
+  delay(50);
+
+  startSensor(sFront, XSHUT_FRONT, 0x30, "Front");
+  startSensor(sLeft,  XSHUT_LEFT,  0x31, "Left");
+  startSensor(sRight, XSHUT_RIGHT, 0x32, "Right");
+  Serial.println("Format: Front  Left  Right (mm)");
+}
+
+void loop() {
+  int f = sFront.read();
+  int l = sLeft.read();
+  int r = sRight.read();
+
+  if (sFront.timeoutOccurred()) f = -1;
+  if (sLeft.timeoutOccurred())  l = -1;
+  if (sRight.timeoutOccurred()) r = -1;
+
+  Serial.print("F: "); Serial.print(f);
+  Serial.print("   L: "); Serial.print(l);
+  Serial.print("   R: "); Serial.println(r);
+  delay(100);
+}
